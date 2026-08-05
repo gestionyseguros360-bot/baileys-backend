@@ -7,9 +7,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => {
-  res.send('Servidor Baileys activo');
-});
+// Ruta principal y de salud
+app.get('/', (req, res) => res.send('Servidor Baileys activo'));
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/status', (req, res) => res.json({ status: 'connected' }));
 
 app.listen(PORT, () => {
   console.log(`Servidor iniciado en puerto ${PORT}`);
