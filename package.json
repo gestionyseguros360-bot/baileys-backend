@@ -1,7 +1,6 @@
-
+{
   "name": "whatsapp-baileys-backend",
   "version": "1.0.0",
-  "description": "Servidor Baileys para conexión WhatsApp por QR/número - backend del dashboard Base44",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
