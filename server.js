@@ -15,7 +15,6 @@ const {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  makeInMemoryStore,
   default: makeWASocket,
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
@@ -28,10 +27,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const logger = pino({ level: "silent" });
 
-// Store en memoria — captura TODOS los contactos y chats automáticamente
-const store = makeInMemoryStore({ logger });
-store.readFromFile("./store.json");
-
 let sock = null;
 let connectionState = {
   status: "disconnected",
@@ -40,9 +35,41 @@ let connectionState = {
   pairingCode: null,
 };
 
-// Mapa en memoria de contactos individuales
-// (Baileys no expone getAllContacts, hay que capturarlos por evento)
+// === ALMACENAMIENTO DE CONTACTOS EN MEMORIA + PERSISTENCIA EN DISCO ===
 const contactsMap = new Map();
+const CONTACTS_FILE = path.join(__dirname, "contacts.json");
+
+function loadContacts() {
+  try {
+    if (fs.existsSync(CONTACTS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CONTACTS_FILE, "utf-8"));
+      for (const [id, c] of Object.entries(data)) {
+        contactsMap.set(id, c);
+      }
+      console.log("[CONTACTS] Cargados", contactsMap.size, "contactos guardados");
+    }
+  } catch (e) {
+    console.error("[CONTACTS] Error cargando:", e.message);
+  }
+}
+
+function saveContacts() {
+  try {
+    const obj = {};
+    for (const [id, c] of contactsMap.entries()) obj[id] = c;
+    fs.writeFileSync(CONTACTS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) {
+    console.error("[CONTACTS] Error guardando:", e.message);
+  }
+}
+
+function upsertContact(id, data) {
+  if (!id) return;
+  const existing = contactsMap.get(id) || {};
+  contactsMap.set(id, { ...existing, ...data, id });
+}
+
+loadContacts();
 
 const AUTH_DIR = path.join(__dirname, "auth_state");
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -62,25 +89,53 @@ async function startSock() {
     browser: ["WhatsApp Masivo", "Chrome", "1.0.0"],
   });
 
-  // Bind del store a los eventos del socket (captura contactos, chats, mensajes)
-  store.bind(sock.ev);
-
   sock.ev.on("creds.update", saveCreds);
 
-  // Guardar store a disco cada 30s para no perder contactos al reiniciar
-  setInterval(() => {
-    try { store.writeToFile("./store.json"); } catch (e) {}
-  }, 30000);
+  // Guardar contactos a disco cada 30s
+  setInterval(saveContacts, 30000);
 
-  // === CAPTURA DE CONTACTOS INDIVIDUALES (backup) ===
+  // === CAPTURA DE CONTACTOS DESDE MÚLTIPLES EVENTOS ===
   sock.ev.on("contacts.upsert", (contacts) => {
     for (const c of contacts) {
-      contactsMap.set(c.id, { ...contactsMap.get(c.id), ...c });
+      upsertContact(c.id, {
+        name: c.notify || c.name || (c.id ? c.id.split("@")[0] : ""),
+        isGroup: c.id ? c.id.includes("@g.us") : false,
+      });
     }
+    saveContacts();
   });
+
   sock.ev.on("contacts.update", (updates) => {
     for (const u of updates) {
-      if (u.id) contactsMap.set(u.id, { ...contactsMap.get(u.id), ...u });
+      upsertContact(u.id, {
+        name: u.notify || u.name || (u.id ? u.id.split("@")[0] : ""),
+        isGroup: u.id ? u.id.includes("@g.us") : false,
+      });
+    }
+  });
+
+  // Capturar contactos desde los chats abiertos
+  sock.ev.on("chats.upsert", (chats) => {
+    for (const c of chats) {
+      if (c.id && !c.id.includes("@g.us")) {
+        upsertContact(c.id, {
+          name: c.name || c.id.split("@")[0],
+          isGroup: false,
+        });
+      }
+    }
+  });
+
+  // Capturar desde mensajes entrantes/salientes
+  sock.ev.on("messages.upsert", ({ messages }) => {
+    for (const m of messages) {
+      const jid = m.key?.remoteJid;
+      if (jid && !jid.includes("@g.us")) {
+        upsertContact(jid, {
+          name: m.pushName || jid.split("@")[0],
+          isGroup: false,
+        });
+      }
     }
   });
 
@@ -108,6 +163,7 @@ async function startSock() {
       connectionState.pairingCode = null;
       connectionState.phone = sock.user ? sock.user.id.split(":")[0] : null;
       console.log("[CONN] Conectado como", connectionState.phone);
+      saveContacts();
     }
 
     if (connection === "close") {
@@ -194,9 +250,9 @@ app.get("/contacts", async (req, res) => {
       return res.status(503).json({ ok: false, error: "WhatsApp no conectado" });
     }
 
-    // Contactos individuales desde el store (makeInMemoryStore captura todos)
+    // Contactos individuales desde contactsMap (capturados por eventos)
     const seen = new Set();
-    const storeContacts = Array.from(store.contacts.values())
+    const individualContacts = Array.from(contactsMap.values())
       .filter((c) => {
         if (!c.id || !c.id.includes("@s.whatsapp.net") || seen.has(c.id)) return false;
         seen.add(c.id);
@@ -204,27 +260,11 @@ app.get("/contacts", async (req, res) => {
       })
       .map((c) => ({
         id: c.id,
-        name: c.notify || c.name || c.id.split("@")[0],
+        name: c.name || c.id.split("@")[0],
         phone: c.id.split("@")[0],
         isGroup: false,
         avatar: null,
       }));
-
-    // Backup: contactsMap (capturados por evento, por si el store no los tiene)
-    const eventContacts = Array.from(contactsMap.values())
-      .filter((c) => c.id && c.id.includes("@s.whatsapp.net") && !seen.has(c.id))
-      .map((c) => {
-        seen.add(c.id);
-        return {
-          id: c.id,
-          name: c.notify || c.name || c.id.split("@")[0],
-          phone: c.id.split("@")[0],
-          isGroup: false,
-          avatar: null,
-        };
-      });
-
-    const individualContacts = [...storeContacts, ...eventContacts];
 
     // Grupos
     const groups = (await sock.groupFetchAllParticipating?.()) || {};
@@ -287,6 +327,7 @@ app.post("/logout", async (req, res) => {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
     fs.mkdirSync(AUTH_DIR, { recursive: true });
     contactsMap.clear();
+    try { fs.unlinkSync(CONTACTS_FILE); } catch (e) {}
     connectionState = { status: "disconnected", phone: null, qr: null, pairingCode: null };
     res.json({ ok: true, message: "Sesión cerrada" });
     setTimeout(() => startSock(), 1000);
