@@ -15,6 +15,7 @@ const {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  makeInMemoryStore,
   default: makeWASocket,
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
@@ -26,6 +27,10 @@ const path = require("path");
 const app = express();
 const PORT = process.env.PORT || 3000;
 const logger = pino({ level: "silent" });
+
+// Store en memoria — captura TODOS los contactos y chats automáticamente
+const store = makeInMemoryStore({ logger });
+store.readFromFile("./store.json");
 
 let sock = null;
 let connectionState = {
@@ -57,9 +62,17 @@ async function startSock() {
     browser: ["WhatsApp Masivo", "Chrome", "1.0.0"],
   });
 
+  // Bind del store a los eventos del socket (captura contactos, chats, mensajes)
+  store.bind(sock.ev);
+
   sock.ev.on("creds.update", saveCreds);
 
-  // === CAPTURA DE CONTACTOS INDIVIDUALES ===
+  // Guardar store a disco cada 30s para no perder contactos al reiniciar
+  setInterval(() => {
+    try { store.writeToFile("./store.json"); } catch (e) {}
+  }, 30000);
+
+  // === CAPTURA DE CONTACTOS INDIVIDUALES (backup) ===
   sock.ev.on("contacts.upsert", (contacts) => {
     for (const c of contacts) {
       contactsMap.set(c.id, { ...contactsMap.get(c.id), ...c });
@@ -181,9 +194,14 @@ app.get("/contacts", async (req, res) => {
       return res.status(503).json({ ok: false, error: "WhatsApp no conectado" });
     }
 
-    // Contactos individuales desde el mapa en memoria
-    const individualContacts = Array.from(contactsMap.values())
-      .filter((c) => c.id && c.id.includes("@s.whatsapp.net"))
+    // Contactos individuales desde el store (makeInMemoryStore captura todos)
+    const seen = new Set();
+    const storeContacts = Array.from(store.contacts.values())
+      .filter((c) => {
+        if (!c.id || !c.id.includes("@s.whatsapp.net") || seen.has(c.id)) return false;
+        seen.add(c.id);
+        return true;
+      })
       .map((c) => ({
         id: c.id,
         name: c.notify || c.name || c.id.split("@")[0],
@@ -192,6 +210,23 @@ app.get("/contacts", async (req, res) => {
         avatar: null,
       }));
 
+    // Backup: contactsMap (capturados por evento, por si el store no los tiene)
+    const eventContacts = Array.from(contactsMap.values())
+      .filter((c) => c.id && c.id.includes("@s.whatsapp.net") && !seen.has(c.id))
+      .map((c) => {
+        seen.add(c.id);
+        return {
+          id: c.id,
+          name: c.notify || c.name || c.id.split("@")[0],
+          phone: c.id.split("@")[0],
+          isGroup: false,
+          avatar: null,
+        };
+      });
+
+    const individualContacts = [...storeContacts, ...eventContacts];
+
+    // Grupos
     const groups = (await sock.groupFetchAllParticipating?.()) || {};
     const groupContacts = Object.values(groups).map((g) => ({
       id: g.id,
